@@ -1,0 +1,400 @@
+8. **Обычный Drain/Stop.** Идемпотентно выключить сканер/re-arm и все новые entries, отменить entries обеих сторон, подтвердить fills, продолжить сопровождение открытых позиций по exit policy. Не выставлять новую generation после закрытия; оставаться `DRAINING`, пока обе позиции плоские и биржа reconciled, затем `STOPPED`.
+9. **Market Close and Stop.** Выполнять только по явному подтверждению согласно разделу 8.3; после фактического close и reconciliation не запускать TP, scanner, повторные entries или автоматическое возобновление.
+10. **AUTO/MANUAL и live config changes.** Сохранить новую версию настройки. Для пустой grid применить только через cancel/reconcile/rebuild flow. При открытой позиции новые параметры не перемещают fills/anchor/TP автоматически; допустимые изменения — блокировка новых входов или понижение риска по migration plan. Повышение лимитов действует только после завершения текущей generation и нового подтверждения.
+
+### 5.8 Отсутствие локального процесса и Windows shutdown
+
+- При штатном закрытии приложения перейти в drain/stop flow: запретить re-arm, остановить scanner, best-effort отменить resting entry orders, сверить отмены и показать открытые позиции/защитные ордера до завершения процесса. Не завершать процесс, сообщая о «безопасной остановке», если ордера/позиции остались неизвестными.
+- При потере питания, crash, network outage или Windows sleep локальная логика не исполняется. Уже принятые биржей ордера могут оставаться активными; не считать, что локальная отмена произошла. На следующем старте восстановиться через reconciliation до любых действий.
+- В MVP не предполагать, что биржа сама защитит позицию, пока бот offline. Определить в runbook и LIVE preflight, какие exits реально resting на бирже и что делать с ними; если требуемый offline protection не обеспечен — блокировать запуск LIVE для этой конфигурации либо явно требовать отдельного принятия риска пользователем.
+- Следить за single-instance lock, системным временем, доступностью диска/БД и энергосбережением. Уведомления не заменяют локальные risk controls.
+
+---
+
+## 6. Сканер и безопасная ротация символов
+
+### 6.1 Universe и фильтры
+
+Сканер получает актуальный список реально торгуемых USDⓈ-M контрактов и обновлённую metadata Binance. В MVP одновременно активна торговля **одним символом**, если отдельные лимиты/тесты не обоснуют многосимвольный режим. Сканирование может охватывать всю eligible universe.
+
+В dashboard задаются:
+
+- нижняя и верхняя границы 24h **quote volume** (контрактная валюта, нормализация/конвертация к единой валюте указана; для USDT/USDC нельзя молча смешивать единицы);
+- пользовательская whitelist/blacklist — optional;
+- funding max, разрешённые contract type/quote assets, timeframe и необходимые strategy/risk limits;
+- параметры дополнительных filters только с unit, диапазоном и объяснением.
+
+Валидация: `volume_min >= 0`, `volume_max > 0`, `volume_min <= volume_max`. Значение volume — биржевая rolling 24h метрика с точной подписью и временем. Volume фильтр — только фильтр ликвидности/допуска; он не предсказывает доходность и не гарантирует достаточную глубину.
+
+### 6.2 Hard filters и рейтинг
+
+Перед допуском проверять как минимум: статус/тип контракта; совместимость symbol filters и капитала; свежесть candles/quotes; spread и глубину по настраиваемым bounds; funding policy; volatility guard; account/symbol risk; доступность order types; минимальный nominal/quantity после округления. ADX/ER/Z-score/volume imbalance могут быть отдельными explainable filters, но не обязательные «магические» константы и не сигналы гарантированного разворота.
+
+Для каждого кандидата показать `eligible / rejected` + точные причины, input timestamps и конфигурацию. Если несколько кандидатов eligible, выбор может использовать детерминированный explainable score, но ranking не доказательство ожидаемой прибыли; отображай компоненты и version алгоритма. Добавь scanner hysteresis: минимум подтверждений/времени устойчивого допуска и минимальный интервал ротации, чтобы не переключать инструмент из-за краткого колебания ranking; пользователь задаёт bounds, hard risk breach может обойти dwell-time только в сторону снижения риска. Если никто не прошёл — `STANDBY_NO_CANDIDATE`, нулевой новый риск и периодическое повторное сканирование.
+
+### 6.3 Handover / ротация
+
+1. Сканер обнаруживает новый предпочтительный кандидат/потерю допуска текущим символом и создаёт причину для handover.
+2. Глобальная стратегия переходит в `DRAINING`: запрещаются новые entry, scan-to-trade и re-anchor; отменяются неисполненные ENTRY orders текущего символа.
+3. Открытые ботом позиции продолжают сопровождаться согласно exit policy. Не закрывать их насильно ради ротации. Предупредить о неопределённости/стоимости удержания.
+4. Если одна нога закрылась, а другая ещё открыта — не считать символ завершённым. Никаких новых сеток на других символах, пока активная позиция не разрешена правилами MVP.
+5. Убедиться через биржевую REST-сверку, что нет позиции, entry/exit order или неизвестного исполнения по текущему символу; закрытие подтверждать фактом биржи, не локальным таймером.
+6. Получить свежий account snapshot, пересчитать новую конфигурацию для следующего символа, проверить metadata, лимиты, funding, ликвидность и cost model. Сохранить handover plan и запросить подтверждение в LIVE, если меняется риск/инструмент согласно политике.
+7. При сетевой ошибке, неразрешённой позиции, смене фильтров/режима, отсутствии кандидатов — оставаться в безопасном standby/reconciliation, не запускать новую пару.
+
+---
+
+## 7. Исполнение, ордера и восстановление
+
+### 7.1 Архитектурное разделение
+
+Создай exchange protocol и Binance adapter, чтобы торговая стратегия не зависела от vendor-specific параметров. Для Binance Futures точно проверить официальные параметры `positionSide`, Hedge Mode, order type/time-in-force/Post-Only, reduce/close semantics, batch ограничения, conditional orders, cancel/amend, listen key/user stream и rate limits. Не переносить `reduceOnly` или order semantics с другой биржи. Для Hedge Mode семантика может отличаться: реализовать только после проверки документации/тестов.
+
+### 7.2 Order intent lifecycle
+
+Для каждой команды:
+
+1. Сгенерировать внутренний `intent_id` и допустимый уникальный Binance `newClientOrderId`; проверить идемпотентность.
+2. Сохранить intent до сетевого вызова, записать grid generation/role/positionSide/config version и planned risk.
+3. До запроса проверить среду, явный разрешённый state, fresh market/account data, price bands, tick/step/min notional, reserve и risk guard.
+4. На timeout считать результат неизвестным. Сначала найти ордер/исполнение по client ID или запросить биржу; не повторять create вслепую.
+5. Обработать ACK, reject, expired, cancelled, partial/filled, duplicate/out-of-order event, REST/WS race, network loss, rate-limit и изменения фильтров.
+6. После критичных изменений сделать reconciliation. Никакого «локально считаем ордер отменённым», пока это не подтверждено.
+
+Post-Only rejection/expiry не конвертировать автоматически в market. Пересчёт цены возможен после свежего quote, cooldown/hysteresis и нового risk guard; не создавай бесконечную cancel/recreate петлю. Учитывай, что amend/batch/cancel-replace не обязательно атомарны и могут терять queue priority; подтверждай реальное поведение Binance.
+
+### 7.3 Данные и сверка
+
+- Public WebSocket для рынка и private WebSocket для account/order событий; REST bootstrap и периодическая сверка. Использовать корректную обработку disconnect/reconnect, stream expiration, sequence/gap/duplicates, server time, backoff и rate limits.
+- После рестарта: загрузить persistent journal/intents/config → не ставить ордера → получить полный account/open-order/position snapshot → сопоставить с локальным state → обработать неизвестные объекты и partial fills → только после явного reconciliation success разрешить продолжение.
+- Приватный stream потерян/устарел — запретить новые риск-увеличивающие действия до восстановления и REST reconciliation. Работа приложения не должна зависеть только от WS-доставки.
+
+---
+
+## 8. Машина состояний и поведение на события
+
+Моделировать глобальный процесс и каждую позиционную ногу раздельно; все переходы guard-ятся и журналируются.
+
+### 8.1 Глобальные состояния
+
+Рекомендуемая модель:
+
+`STOPPED → PREFLIGHT → STANDBY → SCANNING → GRID_PROPOSED → ACTIVE → DRAINING → STOPPED`
+
+Безопасные дополнительные состояния: `PAUSED`, `COOLDOWN`, `RECONCILIATION_REQUIRED`, `AGENT_OFFLINE`, `ERROR`, `EMERGENCY_CLOSING`.
+
+- `ACTIVE` означает: система торгует разрешённую grid generation; не означает, что у неё обязательно есть позиция.
+- `DRAINING` означает: сканер/ротация и любые новые entry отключены; все непрошедшие entry отменяются; уже открытые позиции сопровождаются только по exit policy.
+- `STOPPED` означает: новые команды/ордера не исполняются, подписки/сканер остановлены насколько возможно; UI честно показывает остаточные ордера/позиции, если они остались, и требует сверки перед новым запуском.
+- `RECONCILIATION_REQUIRED`/`ERROR`: нет нового риска; отдельная диагностика, уведомления, восстановление. Никогда не трактовать как автоматический resume.
+
+### 8.2 Обычная остановка (Drain and Stop)
+
+По `/stop`, кнопке «Остановить и довести позиции» или эквивалентному действию:
+
+1. Проверить полномочия/nonce/подтверждение и записать audit.
+2. Атомарно запретить новые grid generation, re-arm, scanner candidate handover и новые entry intents.
+3. Остановить scanner и новые записи параметров, способные повысить риск; уведомить, что приложение в режиме завершения.
+4. Отменить все неисполненные **входные** ордера, включая обе стороны. До подтверждения отмены учитывать, что они могут успеть исполниться; получить все fills и positions заново.
+5. Не отменять защитный exit/TP автоматически, если он является частью допустимого сопровождения. Сверять объём close order с фактической позицией, не создавать «выход большего объёма».
+6. Доводить до фактического закрытия открытые ботом позиции по активной exit policy. Не создавать новые входы на другом символе; не обещать TP/срок/прибыль.
+7. После подтверждения нулевой позиции, отсутствия ордеров и reconciliation success — перейти в `STOPPED`. Если связь пропала/позиция застряла — остаться `DRAINING`/`RECONCILIATION_REQUIRED`, уведомлять, не заявлять «всё закрыто».
+8. Если позиция долго не закрывается, продолжать показывать возраст/риск/funding и ждать команды. Автоматический market exit допустим только если пользователь отдельно задал и подтвердил такую политику заранее; базовое поведение — не переключать тип исполнения автоматически.
+
+### 8.3 «Закрыть по рынку и остановить»
+
+Это отдельное высокорисковое подтверждаемое действие, не синоним обычного stop.
+
+1. Требовать явное подтверждение с environment, symbol, текущими Long/Short позициями, примерной стоимостью/спредом, возможным taker fee/slippage и предупреждением, что цена исполнения не гарантируется.
+2. Запретить scanner/new entries; отменить все ENTRY и конфликтующие EXIT orders; дождаться результата отмены/сверить fills.
+3. Получить свежий position snapshot; закрывать только фактическую оставшуюся bot-owned позицию корректной Binance Hedge Mode семантикой и quantity, не открыть противоположную позицию. Обработать обе ноги независимо.
+4. При timeout/частичном fill не повторять market order без сверки; сначала заново запросить остаточную позицию, использовать client IDs/корректный close intent и reconciliation.
+5. После закрытия проверить нулевую позицию и отсутствие конфликтных ордеров с биржей. Только тогда `STOPPED`; возобновление — отдельная команда/подтверждение и новый preflight.
+6. При недоступной бирже показать `CLOSE REQUEST NOT CONFIRMED`; не утверждать, что позиция закрыта. Эскалировать критическое уведомление.
+
+### 8.4 Возобновление
+
+`Resume` запрещён при неизвестной позиции/ордерах, offline agent, stale account/market data, неготовой стратегии, невыполненных risk config или нарушенных limits. Перед resume: reconcile, проверить доступность private/public streams, конфигурацию среды, свежий баланс, scanner и новый grid proposal. В LIVE требовать явное подтверждение. Telegram не может обойти блокирующий guard.
+
+### 8.5 Отказы и события
+
+Для каждого события определить state transition, account action, retryability, user notification и tests:
+
+- частичное исполнение любого уровня;
+- одновременно исполненные/частично исполненные Long и Short;
+- gap/spike, price band, устаревшая свеча/quote, отсутствующий funding;
+- Post-Only reject, rate limit, server timeout/5xx, private stream reconnect;
+- падение баланса/equity, margin reserve/limits, неожиданный внешний order/position;
+- смена API permissions, account position mode, leverage bracket или symbol filters;
+- Windows sleep/hibernation, процесс kill, reboot, clock drift, DB lock/corruption, relay/Telegram offline;
+- истечение/дублирование/повтор Telegram confirmation callback;
+- параллельные клики/команды Start, Stop, Close Market, переключение TEST/LIVE.
+
+Команды состояния сериализовать/идемпотентно обрабатывать. Не допускать гонки, в которой Stop проигрывает Start или Live переключается при pending order.
+
+---
+
+## 9. Dashboard и Telegram UX
+
+### 9.1 Telegram Web App как основной dashboard/admin
+
+Dashboard должен давать пользователю управляемый обзор, а не только кнопки торговли.
+
+Основные разделы:
+
+1. **Главная:** TEST/LIVE, состояние сервиса и агента, Binance connectivity, последние market/account timestamps, активная стратегия/символ, режим сканера, актуальные предупреждения.
+2. **Account/Risk:** equity, available balance, capital allocation, reserve, open orders, positions Long/Short, gross/net notional, margin, maintenance/risk indicators, fees/funding/realized/unrealized PnL отдельно. Каждый показатель показывает время/источник и «виртуальный»/«реальный» label.
+3. **Grid:** anchor, timeframe, ATR/relative volatility, шаг/расстояния, веса, число уровней, уровни/цены/quantity/notional обеих сторон, pending/fill/TP, grid generation/version, current effective config и причины AUTO-изменений.
+4. **Scanner:** min/max 24h quote volume, кандидатный список, score/filters/rejection reasons, last scan time, следующая ротация/почему заблокирована.
+5. **Parameters:** все доступные пользователю параметры стратегии/сканера/риска с AUTO/MANUAL только там, где реализовано; units, source, min/max, validation, объяснение текущего effective value и diff; funding module/config; leverage/margin mode как отображаемые account settings и допустимые user bounds, не account-wide auto-change; cost/fee assumptions; LIVE session/manual-per-grid confirmation policy; confirm-save flow. Hard safety invariants нельзя отключать через UI.
+6. **Controls:** start/resume, pause entries, ordinary drain/stop, close market and stop, environment switch; каждое действие отображает результат/неопределённость.
+7. **History/Audit:** конфигурации, подтверждения, intents/orders/fills, transitions, scanner decisions, risk blocks, ошибки; без секретов.
+
+Риск-создающие действия подтверждать с коротким expiry, уникальным nonce и точным summary; кнопка «подтвердить» показывает среду/символ/объём/лимиты, а не общую фразу. Повтор/просроченный callback отвергать. Проверять Telegram init data на сервере; allowlist по неизменяемому Telegram numeric user ID, не username.
+
+### 9.2 Telegram bot commands/notifications
+
+Минимальные read-only endpoints: `/status`, `/balance`, `/grid`, `/scanner`, `/positions`, `/orders`, `/pnl`, `/risk`, `/help`. Чувствительные данные редактировать/минимизировать.
+
+Управление: `/pause`, `/resume`, `/drain`/`/stop`, `/close_market_and_stop`, кнопка смены режима, редактирование параметров через Mini App. Каждый risk-changing action подтверждается, журналируется и проходит локальный policy engine. LIVE нельзя впервые активировать одной Telegram-командой. Не вводить Binance key/secret через чат.
+
+Telegram bot может работать long polling на локальном компьютере. Если процесс/агент остановлен, бот/UI должны честно сообщить, что команды не исполняются. Не создавать скрытую очередь риск-команд для выполнения позже.
+
+### 9.3 Защита UI и локального API
+
+- Локальный FastAPI/control API по умолчанию bind только loopback; строгие CORS/CSRF, авторизация, origin/host validation против DNS rebinding, rate limits и schema validation.
+- Cloud relay не должен иметь право напрямую обходить локальные guards. Локальный agent валидирует каждый запрос/подпись, nonce, timestamp, allowlist, current state и risk.
+- Не отдавать stack traces/secrets в UI. Structured logs redacted. Администраторская панель не является разрешением отключать hard limits.
+
+---
+
+## 10. Архитектура приложения
+
+Потоки команд:
+
+`Telegram Mini App / Bot → Authenticated Relay (если нужен) → Local Control API → Application Service → Policy + Risk Guard → Strategy/Execution Intents → Binance Adapter → Binance`
+
+Потоки данных:
+
+`Binance Public REST/WS + Private REST/WS → Normalizers → Market/Account State → Reconciler → Strategy/State Machines → SQLite Journal/Ledger → Local API/Telegram Views`
+
+Рекомендуемые bounded contexts / пакеты:
+
+- `domain/`: Decimal value objects, symbols/filters, balances, positions, orders, fills, funding, grid config/proposal, risk limits, states/events.
+- `market_data/`: Binance public feeds, candles, book/ticker/trades, freshness/normalization, reconnect.
+- `indicators/`: ATR/TR, normalized volatility, optional ADX/Z-score/ER/VWAP; чистые функции и metadata.
+- `scanner/`: universe, volume/funding/liquidity/risk filters, ranking reasons, handover decision.
+- `strategy/`: paired grid planner, weights/spacing, anchor/reconfiguration, TP/exit calculations, mode decisions.
+- `risk/`: sizing/preflight, account and symbol caps, gross/net exposure, margin, stress, circuit breakers, freshness guards.
+- `exchange/`: exchange protocol, Binance USDⓈ-M adapter, Test/LIVE endpoint separation, metadata, rates, credentials abstraction.
+- `execution/`: persistent intents/idempotency, order lifecycle, cancel/replace sequencing, partial fills, emergency close.
+- `reconciliation/`: startup, reconnect and periodic source-of-truth comparison.
+- `ledger/`: fills, costs, funding, PnL, audit events, snapshots.
+- `application/`: use cases, state orchestration, command serialization, event bus.
+- `persistence/`: SQLite repositories, schema migrations, WAL/backup policy.
+- `api/`: local FastAPI, auth, dashboard service endpoints.
+- `telegram/`: polling, Telegram Web App validation integration, allowlist, commands, notification routing.
+- `relay/`: optional client protocol for outbound authenticated connection; no exchange credentials.
+- `config/`: typed settings, AUTO/MANUAL parameters, environment profiles, secret references.
+- `observability/`: redaction, health/readiness, structured logs, metrics.
+
+Предварительная структура (адаптировать к существующему репозиторию, не создавать дубликаты без причины):
+
+```text
+src/gridbot/
+  main.py
+  config/
+  domain/
+  market_data/
+  indicators/
+  scanner/
+  strategy/
+  risk/
+  exchange/
+  execution/
+  reconciliation/
+  ledger/
+  persistence/
+  application/
+  api/
+  telegram/
+  relay/
+  observability/
+  resources/templates/         # только если нужен локальный fallback UI
+  resources/static/
+tests/
+  unit/
+  property/
+  integration/
+  simulation/
+  security/
+docs/
+  architecture.md
+  risk-model.md
+  operations.md
+  exchange/binance.md
+  telegram-mini-app.md
+  runbook.md
+  decisions.md
+.env.example
+.gitignore
+pyproject.toml
+README.md
+```
+
+Стек выбирай минимальный и актуальный: поддерживаемый Python, `asyncio`, FastAPI, typed settings, SQLite и миграции, Telegram Bot API SDK, Binance connector/тонкий документированный клиент. Не смешивай blocking I/O с event loop. Зафиксируй версии зависимостей и обоснование. Для рынка/ордеров предпочитай узкий adapter, покрытый тестами, а не «универсальную» библиотеку с неясной поддержкой Hedge Mode.
+
+---
+
+## 11. Устойчивость, аудит и безопасность
+
+- SQLite хранит версионируемую конфигурацию, persistent order intents, normalized events, fills/cost ledger, account snapshots, scanner decisions и append-only audit trail. Не хранить API secret в БД.
+- Устанавливать транзакционные границы/unique keys для intents/client IDs/callback nonces; обработать DB lock, migration failure, диск заполнен и некорректное завершение.
+- На Windows запретить случайное двойное выполнение одного экземпляра (process lock), обрабатывать SIGINT/закрытие окна/service shutdown, но аварийное завершение не должно терять intent/outcome.
+- Пользователю показать, что сон/hibernation/выключение компьютера прерывает локального бота. Нельзя обещать контроль ордеров во время offline; политику оставшихся биржевых ордеров при потере процесса явно задать и протестировать.
+- Audit event: user identity, actor/source (Mini App/Bot/local), действие, confirmation id, timestamp, environment, symbol, config hash, preflight snapshot reference, result/rejection reason; без credentials и секретных payload.
+- Все endpoint имеют timeout, контролируемый backoff, server clock checks, rate-limit compliance, jitter и ограничение конкурентности. При повторе ордера — сначала reconciliation по client ID.
+- Health/readiness отдельно: процесс жив, market feed fresh, private account feed healthy, reconciled, strategy разрешена. Telegram online не означает trade engine ready.
+- Backup/restore SQLite, schema migration, export audit и log retention документировать и тестировать.
+- Для неизвестных чужих позиций/ордеров — fail closed. Не закрывать автоматически вручную созданную позицию, не присваивать её боту. Показать конфликт и дать безопасное действие/инструкцию.
+
+---
+
+## 12. План разработки и критерии завершения этапов
+
+### Этап 0 — обследование и решения
+
+- Прочитать репозиторий и все исходные материалы; проверить `git status`, `AGENTS.md`/прочие правила, существующие тесты и конфиги.
+- Составить source-of-truth и glossary, архитектурную схему, state machine, threat model, data flow и таблицу противоречий.
+- Сверить Binance USDⓈ-M, Telegram Mini App и Windows security требования с официальной документацией, записать ссылки/дату.
+- Разрешить/вынести на вопрос пользователя внешнюю инфраструктуру Mini App (hosting/relay), LIVE risk caps, margin/position mode/account isolation и policy при длительном drain.
+- **Готово:** документированы MVP scope, неподтверждённые предположения, flow, hard guards и test plan; никаких ордеров.
+
+### Этап 1 — доменная модель и расчёты без сети
+
+- Decimal types, контрактные метаданные, symbol rounding, budget/risk, paired grid proposal, fees/funding model, cost-aware exits.
+- Pure deterministic functions; статический AUTO/MANUAL evaluator; объяснимые validation errors.
+- Unit/property tests на precision, суммирование weights, limits, обе ноги, объём, округление и close semantics.
+- **Готово:** при неверных/неполных входных данных расчёт не создаёт proposal или выдаёт explicit rejection; нет сетевых побочных эффектов.
+
+### Этап 2 — Paper engine и сценарии
+
+- Реальные public Binance data adapter (read-only), paper execution с виртуальным балансом; fake/replay adapter для контролируемых событий.
+- Консервативная симуляция maker fills, queue uncertainty, partial fills, commission, funding, spread, latency, rejects и downtime. Не считать касание цены автоматическим гарантированным fill.
+- Order state machine, paired grid, positions, cancel/stop/drain, force-close simulation, restart/reconciliation.
+- Сценарии тренда, гэпа, обнуления одной стороны, одновременно Long/Short, stale feed, partial exit, комиссий выше цели, изменившегося minNotional и баланса вниз.
+- **Готово:** детерминированные повторяемые тесты, нет двойных intents/потерянных fills; live order endpoint технически недоступен из TEST path.
+
+### Этап 3 — Binance adapter и (по отдельному opt-in) Testnet
+
+- Реализовать account snapshots, market metadata, public/private streams, user data stream, time sync, symbol/account state, REST reconciliation, orders/filters/rate limits.
+- Документировать текущие endpoints, enums, лимиты и semantics из официального источника.
+- Отдельная изоляция credentials/config Testnet/Live; минимальные права; no withdraw.
+- Только ручной Testnet smoke test с подтверждением; автоматические тесты не должны случайно отправлять реальные заявки.
+- **Готово:** протестированы disconnect/timeout/partial fill/restart/unknown create outcome; состояние после reconcile совпадает с биржей.
+
+### Этап 4 — Dashboard и Telegram Mini App/relay
+
+- UX read-only, конфиги, scanner, proposal, risk report, подтверждения, controls и audit.
+- Настроить Telegram initData validation, allowlist, expiry/replay, offline indication, loopback API protection, relay protocol/auth.
+- Проверить, что сообщения/кнопки не обходят risk guard и LIVE нельзя включить одной Telegram-командой.
+- **Готово:** безопасность UI, подтверждений и offline состояния проверена; схема hosting/relay документирована.
+
+### Этап 5 — Scanner, AUTO и ротация
+
+- Volume min/max, symbol universe, funding/liquidity/spread/volatility filters, explainability и no-candidate standby.
+- AUTO шаг/число уровней/веса только после backtest/replay и bounded risk. Handover только после полного drain и новой account preflight.
+- **Готово:** кандидаты воспроизводимы, причины корректны, отсутствие кандидатов не приводит к торговле, ротация не оставляет сиротских ордеров.
+
+### Этап 6 — Hardening/release
+
+- Windows install/run/update, single-instance lock, secret store, SQLite migration/backup, structured redacted logs, graceful shutdown, power/network failure tests.
+- Dependency/security checks, lint/type checks, unit/integration/property/simulation/security suite, Testnet smoke test report.
+- README: установка, TEST, market data, Web App hosting/relay, секреты, LIVE gating, stop/drain, close market, recovery, ограничения и устранение неполадок.
+- **Готово:** новый пользователь запускает TEST на реальных данных без торговых ключей; LIVE остаётся opt-in и блокируется при неразрешённых проверках.
+
+### Итерационные правила
+
+Работай небольшими вертикальными этапами. Перед существенными правками — сообщай план и файлы. После каждого этапа запускай реальные доступные проверки и исправляй выявленные дефекты. Не создавать лишние отчёты/дублирующие реализации. Финальный статус должен перечислить изменённые файлы, команды и фактические результаты, непроверенные сценарии, решения пользователя и оставшийся риск.
+
+---
+
+## 13. Обязательный тест-план
+
+### Unit/property
+
+- Decimal precision, tick/step/minNotional/minQty, multiplier и directional rounding;
+- ATR/TR/relative volatility warmup, gaps, missing candles, zero/NaN and timezone;
+- grid prices, both sides, N constraints, weights and budget reservation;
+- actual contract PnL, partial entry/exit, fees, funding, close quantity and account aggregation;
+- gross/net exposure, margin brackets, reserve, stress scenarios, budget cap and post-rounding constraints;
+- invariants: `sum(weights)=1`, quantity cannot increase risk beyond allocation, no grid if any hard limit fails, closing order cannot increase exposure, no new risk in drain/paused/reconciliation state.
+
+### State machine / concurrency
+
+- every allowed/forbidden transition; paired entries, one/both legs filled, partials and simultaneous events;
+- Stop racing with Start/Resume, TEST↔LIVE switching, callback replay, duplicate command, concurrent confirms;
+- cancel/create race, create timeout, unknown order, out-of-order events, restart after intent persist and after exchange ACK;
+- drain leaves exits but cancels all entries; close-market stops only after actual flat reconciliation;
+- no rearm/rotation while any unhandled position/unknown order exists.
+
+### Simulation/replay
+
+- trend without pullback; price jumps across all levels; fast reversal; low-volume/spread blowout; maker rejection; no fill; partial fill; spread/cost > target; funding change; user range excludes all tokens; scanner rotates during open position;
+- balance drop, reduced available margin, unexpected position/order; filters change mid-grid;
+- stream downtime, API timeout/rate limit, stale server clock, power loss/restart, local DB backup restore;
+- crash after request but before response and after partial close.
+
+### Security
+
+- wrong Telegram ID/username spoof, forged/expired initData, invalid signature, replayed callback, relay replay, unauthorized local API, CSRF/CORS/DNS rebinding, secret redaction, path/config injection;
+- Mini App/local agent offline, stolen/expired relay credential, multiple users, rate abuse;
+- assert in TEST that trade endpoints/calls are never made.
+
+### Binance Testnet/manual smoke
+
+- separate keys and endpoint, account position mode, symbol metadata, Post-Only reject, partial fill/order status/cancel/reconcile and restart; exact close semantics in Hedge Mode.
+- No test automatically sends LIVE order. Use explicit test harness guard and inspect target environment before any order call.
+
+---
+
+## 14. LIVE release gates (all required)
+
+Do not mark LIVE-ready unless all are true and evidenced:
+
+- Binance rules and adapter behavior are checked against current official docs and Testnet where possible;
+- `TEST` architecture cannot call any real order mutation method, and this is covered by tests;
+- LIVE is disabled by default, separate credentials, least privilege, explicit local activation and risk confirmation;
+- account snapshot, symbol filters, position mode, open orders/positions and reconciliation are all healthy and fresh before new grid;
+- all allocation, margin, gross/net, drawdown, per-symbol, daily-loss, open-order and funding limits are explicitly configured and hard-enforced; if a required limit is absent, block LIVE;
+- no external/unowned position or order is silently adopted/closed;
+- both simultaneous grids fit their combined worst-case scenario; no simplistic liquidation formula is used as risk proof;
+- order idempotency, timeout reconciliation, partial fills, close semantics and shutdown/restart are tested;
+- emergency/stop policy, Windows offline behavior, Telegram relay and security are documented;
+- user explicitly understands fees, funding, slippage, liquidation, maker non-fill, machine downtime and risk of loss.
+
+Passing tests does not prove strategy profitability or eliminate operational risk. LIVE activation remains a separate user decision.
+
+---
+
+## 15. Решения, которые нужно запросить при реализации (не блокировать TEST)
+
+Из исходного запроса уже известны биржа, ОС, оба направления сетки, базовый интерфейс, TEST/LIVE и фильтр по объёму; не задавай их повторно. Если проект доходит до соответствующих этапов, уточни только недостающее:
+
+1. Telegram Mini App hosting/relay: согласен ли пользователь на HTTPS relay/tunnel; где размещается frontend/relay и кто оплачивает/обслуживает. Не выставлять сырой локальный API наружу.
+2. LIVE-лимиты: max allocation (процент и абсолютный cap), gross/net exposure, максимальное плечо/маржа, per-symbol/account limit, daily loss/equity drawdown, максимальное число уровней и поведение circuit breaker. До явного решения — TEST only.
+3. Binance account setup: выделенный ли аккаунт/subaccount; position mode/margin mode; бот не переключает account-wide режим автоматически. До сверки — LIVE block.
+4. Поведение drain при долго не закрывающейся позиции: оставлять открытой до TP/ручного решения (безопасное исходное поведение) либо отдельно настроить временной stop/force close. Не вводить автоматический market close без выбора.
+5. AUTO min/max для каждого параметра и конкретный набор таймфреймов/периодов, если пользователь хочет менять отличные от указанных в диалоге значения.
+
+Не проси API key, secret, Telegram token или пароль в чате. Предложи ввод через защищённый локальный setup flow.
+
+---
+
+## 16. Краткое резюме логической идеи для реализации
+
+Это локальное Windows-приложение с Python execution engine. Оно получает реальные Binance USDⓈ-M market data; TEST моделирует исполнение и никогда не отправляет реальные ордера, LIVE использует реальные заявки только после строгого preflight. Telegram Web App — dashboard/admin, Telegram bot — дополнительный канал статуса/команд; локальный агент и его risk engine остаются источником истины.
+
+На каждый новый grid запуск движок сначала синхронизирует состояние с биржей, получает свежий баланс/позиции/ордера/filters, пересчитывает bounded allocation и полную стоимость/маржу обеих одновременно размещаемых сеток. Затем сканер допускает только контракты в пользовательском 24h quote-volume диапазоне и остальные hard filters. Grid строится из реальной недавней волатильности и ручных/AUTO параметров, округляется по контрактным правилам и проходит worst-case risk checks. При любом неопределённом результате новые entries блокируются.
+
+Пользователь может штатно остановить новые входы и сканирование, оставив выходы для текущих позиций; либо отдельным подтверждением закрыть фактические позиции по рынку и остановиться. Ни индикатор, ни лимитный ордер, ни встречная нога не гарантируют прибыль, нейтральность или безопасное закрытие. Цель продукта — прозрачное управление ограниченным риском и корректная инженерная реализация, а не максимизация оборота или обещание дохода.
